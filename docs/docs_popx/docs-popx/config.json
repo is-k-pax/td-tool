@@ -1,0 +1,13 @@
+{
+  "index_name": "docs-popx",
+  "embed_model": "nomic-embed-text-v2-moe",
+  "embed_provider": "local",
+  "embed_dimension": 0,
+  "chunk_size": 1024,
+  "chunk_overlap": 128,
+  "chunk_strategy": "recursive",
+  "created_at": "2026-09-05 04:04:07",
+  "td_version": "099",
+  "operator": "search_index",
+  "version": "1.0.0"
+}

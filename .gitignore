@@ -1,0 +1,7 @@
+# Carpeta cruda del indice ChromaDB (version comprimida .rar si se sube)
+docs/derivative-touchdesigner-docs/
+
+# Basura habitual de TouchDesigner / Windows
+*.tmp
+Thumbs.db
+desktop.ini
