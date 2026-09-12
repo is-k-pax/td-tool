@@ -5,3 +5,8 @@ docs/derivative-touchdesigner-docs/
 *.tmp
 Thumbs.db
 desktop.ini
+ 
+# Entornos virtuales Python 
+standalone_mcp/venv/ 
+__pycache__/ 
+*.pyc
