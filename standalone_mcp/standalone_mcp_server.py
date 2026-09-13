@@ -20,9 +20,17 @@ Tools expuestas:
 import argparse
 import asyncio
 import io
+import os
 import subprocess
+import sys
+import threading
+import time
 import traceback
-from contextlib import redirect_stdout, redirect_stderr
+
+# Codificacion real de la consola: en Windows cmd usa la pagina OEM (cp850
+# aqui), no la ANSI que Python asume por defecto -- por eso las enyes y
+# tildes llegaban rotas.
+_CONSOLE_ENC = "oem" if os.name == "nt" else "utf-8"
 
 from aiohttp import web
 
@@ -74,29 +82,121 @@ TOOLS = [
     },
 ]
 
+class _ThreadStream:
+    """sys.stdout/stderr compartido, con un buffer por hilo.
+
+    redirect_stdout() no sirve aqui: cambia sys.stdout para TODO el
+    proceso, asi que un hilo que se queda colgado tras un timeout nunca
+    sale del context manager y se traga la salida de las llamadas
+    siguientes. Esto aisla cada ejecucion a su propio hilo.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._buffers = {}
+
+    def register(self, buf):
+        self._buffers[threading.get_ident()] = buf
+
+    def unregister(self):
+        self._buffers.pop(threading.get_ident(), None)
+
+    def write(self, s):
+        buf = self._buffers.get(threading.get_ident())
+        if buf is not None:
+            return buf.write(s)
+        return self._real.write(s) if self._real else len(s)
+
+    def flush(self):
+        if self._real:
+            self._real.flush()
+
+    def isatty(self):
+        return False
+
+
+_stdout_mux = _ThreadStream(sys.stdout)
+_stderr_mux = _ThreadStream(sys.stderr)
+sys.stdout = _stdout_mux
+sys.stderr = _stderr_mux
+
+
 # Persiste variables entre llamadas a run_python, igual que td_code
 _globals_ns = {}
+
+# Ejecuciones que agotaron su timeout y siguen vivas. Python no permite
+# matar un hilo, asi que lo unico honesto es avisar de que ese codigo
+# sigue corriendo y puede seguir tocando _globals_ns.
+_runaway = []
+
+
+def _clean_traceback():
+    """Traceback recortado: empieza en el codigo del usuario, sin los
+    frames internos del servidor."""
+    lines = traceback.format_exc().splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if 'File "<run_python>"' in line:
+            return "Traceback (most recent call last):\n" + "".join(lines[i:])
+    return "".join(lines)
+
+
+def _compose(out, err, extra=""):
+    """Salida final: SIEMPRE lo que se llego a imprimir, aunque despues
+    petara o se agotara el timeout."""
+    parts = []
+    if out.getvalue():
+        parts.append(out.getvalue().rstrip("\n"))
+    if err.getvalue():
+        parts.append("[stderr]\n" + err.getvalue().rstrip("\n"))
+    if extra:
+        parts.append(extra)
+    return "\n".join(parts) if parts else "(sin salida)"
 
 
 async def _tool_run_python(args):
     code = args.get("code", "")
     timeout = float(args.get("timeout", 30))
     out, err = io.StringIO(), io.StringIO()
+    box = {}
 
-    def _exec():
-        with redirect_stdout(out), redirect_stderr(err):
+    _runaway[:] = [t for t in _runaway if t.is_alive()]
+    aviso = ""
+    if _runaway:
+        aviso = ("[aviso] %d ejecucion(es) anterior(es) agotaron su timeout y "
+                 "siguen vivas en segundo plano; pueden estar modificando las "
+                 "variables compartidas.\n" % len(_runaway))
+
+    done = threading.Event()
+
+    def _run():
+        _stdout_mux.register(out)
+        _stderr_mux.register(err)
+        try:
             exec(compile(code, "<run_python>", "exec"), _globals_ns)
+        except BaseException:
+            box["tb"] = _clean_traceback()
+        finally:
+            _stdout_mux.unregister()
+            _stderr_mux.unregister()
+            done.set()
 
-    try:
-        await asyncio.wait_for(asyncio.to_thread(_exec), timeout=timeout)
-        result = out.getvalue()
-        if err.getvalue():
-            result += "\n[stderr]\n" + err.getvalue()
-        return result or "(sin salida)"
-    except asyncio.TimeoutError:
-        return f"[error] timeout tras {timeout}s"
-    except Exception:
-        return "[error]\n" + traceback.format_exc()
+    # Hilo propio y daemon: uno colgado no impide cerrar el servidor.
+    # Los de asyncio.to_thread si lo impiden (se esperan al salir).
+    th = threading.Thread(target=_run, daemon=True, name="run_python")
+    th.start()
+
+    limite = time.monotonic() + timeout
+    while not done.is_set() and time.monotonic() < limite:
+        await asyncio.sleep(0.02)
+
+    if done.is_set():
+        return aviso + _compose(out, err, box.get("tb", ""))
+
+    _runaway.append(th)
+    return aviso + _compose(out, err, (
+        "[error] timeout tras %ss -- el codigo SIGUE ejecutandose en segundo "
+        "plano (Python no puede matar un hilo). Arriba tienes lo que llego a "
+        "imprimir. Si se ha quedado colgado, reinicia el servidor." % timeout))
 
 
 async def _tool_run_command(args):
@@ -104,9 +204,13 @@ async def _tool_run_command(args):
     timeout = float(args.get("timeout", 30))
     try:
         proc = await asyncio.to_thread(
-            subprocess.run, command, shell=True, capture_output=True, text=True, timeout=timeout
+            subprocess.run, command, shell=True, capture_output=True,
+            encoding=_CONSOLE_ENC, errors="replace", timeout=timeout,
         )
         return f"[returncode] {proc.returncode}\n[stdout]\n{proc.stdout}\n[stderr]\n{proc.stderr}"
+    except subprocess.TimeoutExpired as e:
+        return (f"[error] timeout tras {timeout}s (proceso terminado)\n"
+                f"[stdout parcial]\n{e.stdout or ''}\n[stderr parcial]\n{e.stderr or ''}")
     except Exception:
         return "[error]\n" + traceback.format_exc()
 
